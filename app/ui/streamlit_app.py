@@ -58,20 +58,36 @@ async def _run_sync(client: GraphClient) -> dict:
     parsed = 0
     imported = 0
     skipped = 0
+    failed = []
+    unmatched_cards = []
 
     messages = client.list_hsbc_transaction_messages(top=100)
     fetched = len(messages)
 
-    failed = []
     async with SessionLocal() as session:
+        # Prefetch existing transaction IDs for instant duplicate checking
+        existing_tx_res = await session.execute(select(Transaction.graph_message_id))
+        existing_ids = set(existing_tx_res.scalars().all())
+
+        # Prefetch active cards mapped by last4
+        cards_res = await session.execute(select(Card).where(Card.active.is_(True)))
+        cards_by_last4 = {c.last4: c for c in cards_res.scalars().all()}
+
         for msg in messages:
-            html = client.message_body(msg["id"])
+            msg_id = msg["id"]
+
+            # Quick duplicate check: skip without downloading HTML body
+            if msg_id in existing_ids:
+                skipped += 1
+                continue
+
             try:
-                tx = parse_transaction(graph_message_id=msg["id"], html=html)
+                html = client.message_body(msg_id)
+                tx = parse_transaction(graph_message_id=msg_id, html=html)
             except Exception as e:
                 failed.append(
                     {
-                        "id": msg["id"],
+                        "id": msg_id,
                         "subject": msg.get("subject", ""),
                         "error": str(e),
                     }
@@ -79,18 +95,18 @@ async def _run_sync(client: GraphClient) -> dict:
                 continue
             parsed += 1
 
-            # Card lookup
-            card_res = await session.execute(select(Card).where(Card.last4 == tx.card_last4))
-            card = card_res.scalar_one_or_none()
+            # Match card
+            card = cards_by_last4.get(tx.card_last4)
             if not card:
-                skipped += 1
-                continue
-
-            # Duplicate check
-            dup_res = await session.execute(
-                select(Transaction).where(Transaction.graph_message_id == tx.graph_message_id)
-            )
-            if dup_res.scalar_one_or_none():
+                unmatched_cards.append(
+                    {
+                        "id": msg_id,
+                        "card_last4": tx.card_last4,
+                        "merchant": tx.merchant,
+                        "amount": float(tx.amount),
+                        "subject": msg.get("subject", ""),
+                    }
+                )
                 skipped += 1
                 continue
 
@@ -107,11 +123,11 @@ async def _run_sync(client: GraphClient) -> dict:
             session.add(transaction)
             try:
                 await session.commit()
+                existing_ids.add(tx.graph_message_id)
+                imported += 1
             except Exception:
                 await session.rollback()
                 skipped += 1
-            else:
-                imported += 1
 
     return {
         "fetched": fetched,
@@ -119,6 +135,7 @@ async def _run_sync(client: GraphClient) -> dict:
         "imported": imported,
         "skipped": skipped,
         "failed": failed,
+        "unmatched_cards": unmatched_cards,
     }
 
 
@@ -242,6 +259,24 @@ async def _fetch_top_merchants(limit: int = 7) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+async def _seed_default_card() -> None:
+    from app.db.enums import Bank, CardNetwork
+
+    async with SessionLocal() as session:
+        res = await session.execute(select(Card).where(Card.last4 == "2677"))
+        if not res.scalar_one_or_none():
+            c = Card(
+                bank_name=Bank.HSBC,
+                card_name="TravelOne",
+                card_network=CardNetwork.MASTERCARD,
+                last4="2677",
+                currency="INR",
+                active=True,
+            )
+            session.add(c)
+            await session.commit()
+
+
 # ------------------------------------------------------------
 # Fetch initial state
 # ------------------------------------------------------------
@@ -276,6 +311,16 @@ with header_col2:
         help="Fetch latest transaction emails from Outlook via Microsoft Graph",
     )
 
+if not card:
+    with st.container(border=True):
+        st.warning(
+            "⚠️ No active credit cards found in the database. "
+            "Please configure a card to import transactions."
+        )
+        if st.button("Configure default HSBC Card (••2677)", type="primary"):
+            asyncio.run(_seed_default_card())
+            st.rerun()
+
 # ------------------------------------------------------------
 # Sync Trigger Handling
 # ------------------------------------------------------------
@@ -301,11 +346,35 @@ if sync_clicked:
                     f"Successfully imported {stats['imported']} new transaction(s)!",
                     icon=":material/celebration:",
                 )
+            elif stats.get("unmatched_cards"):
+                st.toast(
+                    f"Found {len(stats['unmatched_cards'])} transaction(s) for unregistered cards.",
+                    icon=":material/warning:",
+                )
             else:
                 st.toast(
                     f"Already up to date. {stats['skipped']} existing transaction(s) verified.",
                     icon=":material/check_circle:",
                 )
+
+            if stats.get("unmatched_cards"):
+                with st.expander(
+                    f"⚠️ Unmatched Card Diagnostics ({len(stats['unmatched_cards'])} skipped)",
+                    expanded=True,
+                    icon=":material/warning:",
+                ):
+                    st.write("Transactions were found for cards not configured in your database:")
+                    for item in stats["unmatched_cards"]:
+                        st.caption(
+                            f"**Card Last 4**: `•••• {item['card_last4']}` "
+                            f"| **Merchant**: {item['merchant']} "
+                            f"| **Amount**: ₹{item['amount']:,.2f}"
+                        )
+                    st.info(
+                        "Tip: Register cards via CLI with "
+                        "`uv run python -m app.cli card add` or seed with "
+                        "`uv run python -m app.cli db seed`."
+                    )
 
             if stats.get("failed"):
                 with st.expander(
@@ -329,6 +398,7 @@ if sync_clicked:
                 expanded=True,
             )
             st.error(f"Error during synchronization: {err}")
+
 
 # ------------------------------------------------------------
 # Hero: Milestone Spending Progress Card

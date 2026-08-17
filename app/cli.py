@@ -15,13 +15,121 @@ app = typer.Typer(help="CCGeek CLI")
 db_app = typer.Typer(help="Database commands")
 graph_app = typer.Typer(help="Microsoft Graph commands")
 
+card_app = typer.Typer(help="Card management commands")
+
 app.add_typer(db_app, name="db")
 app.add_typer(graph_app, name="graph")
+app.add_typer(card_app, name="card")
 
 
 @db_app.command("test")
 def test_db() -> None:
-    typer.secho("✓ Database OK", fg=typer.colors.GREEN)
+    async def _test() -> None:
+        async with SessionLocal() as session:
+            cards_count = (await session.execute(select(Card))).scalars().all()
+            tx_count = (await session.execute(select(Transaction))).scalars().all()
+            typer.secho("✓ Database connection OK", fg=typer.colors.GREEN)
+            typer.echo(f"Cards configured: {len(cards_count)}")
+            typer.echo(f"Transactions in DB: {len(tx_count)}")
+
+    asyncio.run(_test())
+
+
+@db_app.command("seed")
+def seed_db() -> None:
+    """Seed initial default credit cards if none exist."""
+
+    async def _seed() -> None:
+        async with SessionLocal() as session:
+            res = await session.execute(select(Card).where(Card.last4 == "2677"))
+            card = res.scalar_one_or_none()
+            if not card:
+                from app.db.enums import Bank, CardNetwork
+
+                card = Card(
+                    bank_name=Bank.HSBC,
+                    card_name="TravelOne",
+                    card_network=CardNetwork.MASTERCARD,
+                    last4="2677",
+                    currency="INR",
+                    active=True,
+                )
+                session.add(card)
+                await session.commit()
+                typer.secho(
+                    "✓ Seeded default card: HSBC TravelOne (••2677)",
+                    fg=typer.colors.GREEN,
+                )
+            else:
+                typer.echo(
+                    f"Card ending in {card.last4} already exists "
+                    f"({card.bank_name} {card.card_name})."
+                )
+
+    asyncio.run(_seed())
+
+
+@card_app.command("list")
+def list_cards() -> None:
+    """List all registered cards in the database."""
+
+    async def _list() -> None:
+        async with SessionLocal() as session:
+            cards = (await session.execute(select(Card).order_by(Card.created_at))).scalars().all()
+            if not cards:
+                typer.secho(
+                    "No cards found in database. Run 'db seed' or 'card add'.",
+                    fg=typer.colors.YELLOW,
+                )
+                return
+            typer.echo(f"Found {len(cards)} card(s):")
+            for c in cards:
+                status = "Active" if c.active else "Inactive"
+                typer.echo(
+                    f"- [{c.bank_name}] {c.card_name} · •••• {c.last4} "
+                    f"({c.card_network}) [{status}] (ID: {c.id})"
+                )
+
+    asyncio.run(_list())
+
+
+@card_app.command("add")
+def add_card(
+    bank: str = typer.Option(..., "--bank", "-b", help="Bank name (HSBC, HDFC, ICICI, AXIS, AMEX)"),
+    name: str = typer.Option(
+        ..., "--name", "-n", help="Card name (e.g. TravelOne, Live+, Premier)"
+    ),
+    network: str = typer.Option(..., "--network", help="Network (VISA, MASTERCARD, AMEX, RUPAY)"),
+    last4: str = typer.Option(..., "--last4", "-l", help="Last 4 digits of card number"),
+    currency: str = typer.Option("INR", "--currency", "-c", help="Currency code (e.g. INR)"),
+) -> None:
+    """Add a new credit card to track."""
+
+    async def _add() -> None:
+        from app.db.enums import Bank, CardNetwork
+
+        async with SessionLocal() as session:
+            res = await session.execute(select(Card).where(Card.last4 == last4.strip()))
+            if res.scalar_one_or_none():
+                typer.secho(f"Card with last4 {last4} already exists!", fg=typer.colors.RED)
+                return
+
+            card = Card(
+                bank_name=Bank(bank.upper()),
+                card_name=name.strip(),
+                card_network=CardNetwork(network.upper()),
+                last4=last4.strip(),
+                currency=currency.upper().strip(),
+                active=True,
+            )
+            session.add(card)
+            await session.commit()
+            typer.secho(
+                f"✓ Added card: {card.bank_name} {card.card_name} (••{card.last4})",
+                fg=typer.colors.GREEN,
+            )
+
+    asyncio.run(_add())
 
 
 @graph_app.command("auth")
@@ -116,43 +224,57 @@ def list_hsbc_messages(
             typer.echo("-" * 80)
 
 
-async def _run_sync(client: GraphClient) -> dict[str, int]:
+async def _run_sync(client: GraphClient) -> dict:
     """Core sync logic used by the ``graph sync`` CLI command."""
     fetched = 0
     parsed = 0
     imported = 0
     skipped = 0
+    failed = []
+    unmatched_cards = []
 
-    # Retrieve HSBC transaction messages (increase top to fetch more)
+    # Retrieve HSBC transaction messages
     messages = client.list_hsbc_transaction_messages()
     fetched = len(messages)
 
-    failed = []  # keep track of messages that could not be parsed
     async with SessionLocal() as session:
-        for msg in messages:
-            # Get full HTML body of the message
-            html = client.message_body(msg["id"])
-            try:
-                tx = parse_transaction(graph_message_id=msg["id"], html=html)
-            except Exception as e:
-                # Parsing failed – skip this email, record the failure
-                failed.append({"id": msg["id"], "subject": msg.get("subject", ""), "error": str(e)})
-                continue
-            parsed += 1
+        # Prefetch existing transaction IDs for fast duplicate checking
+        existing_tx_res = await session.execute(select(Transaction.graph_message_id))
+        existing_ids = set(existing_tx_res.scalars().all())
 
-            # Find the Card by its last4 digits
-            card_res = await session.execute(select(Card).where(Card.last4 == tx.card_last4))
-            card = card_res.scalar_one_or_none()
-            if not card:
-                # No matching card configured – skip
+        # Prefetch active cards mapped by last4
+        cards_res = await session.execute(select(Card).where(Card.active.is_(True)))
+        cards_by_last4 = {card.last4: card for card in cards_res.scalars().all()}
+
+        for msg in messages:
+            msg_id = msg["id"]
+
+            # Quick duplicate check: skip without fetching HTML body
+            if msg_id in existing_ids:
                 skipped += 1
                 continue
 
-            # Check whether this message has already been imported
-            dup_res = await session.execute(
-                select(Transaction).where(Transaction.graph_message_id == tx.graph_message_id)
-            )
-            if dup_res.scalar_one_or_none():
+            # Get full HTML body of the message
+            try:
+                html = client.message_body(msg_id)
+                tx = parse_transaction(graph_message_id=msg_id, html=html)
+            except Exception as e:
+                failed.append({"id": msg_id, "subject": msg.get("subject", ""), "error": str(e)})
+                continue
+            parsed += 1
+
+            # Match card
+            card = cards_by_last4.get(tx.card_last4)
+            if not card:
+                unmatched_cards.append(
+                    {
+                        "id": msg_id,
+                        "card_last4": tx.card_last4,
+                        "merchant": tx.merchant,
+                        "amount": float(tx.amount),
+                        "subject": msg.get("subject", ""),
+                    }
+                )
                 skipped += 1
                 continue
 
@@ -169,11 +291,11 @@ async def _run_sync(client: GraphClient) -> dict[str, int]:
             session.add(transaction)
             try:
                 await session.commit()
+                existing_ids.add(tx.graph_message_id)
+                imported += 1
             except Exception:
                 await session.rollback()
                 skipped += 1
-            else:
-                imported += 1
 
     return {
         "fetched": fetched,
@@ -181,6 +303,7 @@ async def _run_sync(client: GraphClient) -> dict[str, int]:
         "imported": imported,
         "skipped": skipped,
         "failed": failed,
+        "unmatched_cards": unmatched_cards,
     }
 
 
@@ -196,6 +319,19 @@ def sync() -> None:
     typer.echo(f"Parsed: {stats['parsed']}")
     typer.echo(f"Imported: {stats['imported']}")
     typer.echo(f"Skipped: {stats['skipped']}")
+    if stats.get("unmatched_cards"):
+        typer.secho(
+            f"⚠️ {len(stats['unmatched_cards'])} transaction(s) skipped "
+            f"because the card is not registered in DB:",
+            fg=typer.colors.RED,
+        )
+        for u in stats["unmatched_cards"]:
+            typer.echo(f"  - Card •••• {u['card_last4']} | {u['merchant']} | ₹{u['amount']}")
+        typer.echo(
+            "Tip: Add the card using "
+            "'uv run python -m app.cli card add' or seed with "
+            "'uv run python -m app.cli db seed'"
+        )
     if stats.get("failed"):
         typer.secho("Parsing failures:", fg=typer.colors.YELLOW)
         for f in stats["failed"]:

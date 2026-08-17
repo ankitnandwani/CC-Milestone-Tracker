@@ -86,46 +86,52 @@ class GraphClient:
     ) -> list[dict]:
         matches: list[dict] = []
 
-        response = self.get(
-            "/me/messages",
-            params={
-                "$top": GRAPH_PAGE_SIZE,
-                "$orderby": "receivedDateTime desc",
-                "$select": ",".join(
-                    [
-                        "id",
-                        "subject",
-                        "from",
-                        "receivedDateTime",
-                    ]
-                ),
-            },
-        )
+        params: dict = {
+            "$search": f'"{HSBC_TRANSACTION_SUBJECT_PREFIX}"',
+            "$top": min(top, GRAPH_PAGE_SIZE) if top is not None else GRAPH_PAGE_SIZE,
+            "$select": ",".join(
+                [
+                    "id",
+                    "subject",
+                    "from",
+                    "receivedDateTime",
+                ]
+            ),
+        }
 
+        url: str | None = "/me/messages"
         pages_processed = 0
 
-        while True:
-            emails = response["value"]
-            matches.extend(email for email in emails if self._is_hsbc_transaction(email))
+        while url:
+            try:
+                response = self.get(
+                    url,
+                    params=params,
+                    headers={"ConsistencyLevel": "eventual"},
+                )
+            except Exception:
+                # Fallback to standard paging if $search fails
+                if url == "/me/messages" and "$search" in params:
+                    params.pop("$search", None)
+                    response = self.get(url, params=params)
+                else:
+                    raise
 
-            if top is not None and len(matches) >= top:
-                break
+            emails = response.get("value", [])
+            for email in emails:
+                if self._is_hsbc_transaction(email):
+                    matches.append(email)
+                    if top is not None and len(matches) >= top:
+                        return matches
 
             pages_processed += 1
             if max_pages is not None and pages_processed >= max_pages:
                 break
 
-            next_link = response.get("@odata.nextLink")
+            url = response.get("@odata.nextLink")
+            params = None
 
-            if not next_link:
-                break
-
-            response = self.get_url(next_link)
-
-        if top is None:
-            return matches
-        else:
-            return matches[:top]
+        return matches if top is None else matches[:top]
 
     def message_body(self, message_id: str) -> str:
         message = self.get(
