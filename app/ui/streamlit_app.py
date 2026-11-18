@@ -29,7 +29,8 @@ from app.db import SessionLocal  # noqa: E402
 from app.db.models.card import Card  # noqa: E402
 from app.db.models.transaction import Transaction  # noqa: E402
 from app.graph.auth import OutlookSignInError, authenticate  # noqa: E402
-from app.graph.client import GraphClient  # noqa: E402
+from app.graph.client import GraphClient, MailFolderError  # noqa: E402
+from app.graph.constants import HSBC_FOLDER_PATH  # noqa: E402
 from app.sync import sync_transactions  # noqa: E402
 
 # ------------------------------------------------------------
@@ -243,16 +244,21 @@ if sync_clicked:
             token = authenticate(show_device_code=st.info)
             stage = "Transaction import"
             with GraphClient(token) as client:
-                st.write("Fetching transaction messages...")
+                st.write(f"Scanning Outlook folder **{' → '.join(HSBC_FOLDER_PATH)}**.")
                 stats = asyncio.run(sync_transactions(client))
+
+            if received_at := stats["latest_received_at"]:
+                st.write(f"Newest email in the folder by received date: {received_at[:10]}.")
+            if stats["ignored"]:
+                st.write(f"{stats['ignored']} email(s) did not match the transaction format.")
 
             status_box.update(
                 label=(
-                    f"Sync complete. Checked {stats['fetched']} alert(s) and imported "
+                    f"Sync complete. Checked {stats['fetched']} email(s) in HSBC and imported "
                     f"{stats['imported']} transaction(s)."
                 ),
                 state="complete",
-                expanded=bool(stats["failed"] or stats["unmatched_cards"]),
+                expanded=not stats["imported"] or bool(stats["failed"] or stats["unmatched_cards"]),
             )
 
             if stats["imported"] > 0:
@@ -266,7 +272,7 @@ if sync_clicked:
                     f"Found {len(stats['unmatched_cards'])} transaction(s) for unregistered cards.",
                     icon=":material/warning:",
                 )
-            elif not stats["failed"]:
+            elif stats["skipped"] and not (stats["failed"] or stats["ignored"]):
                 st.toast(
                     f"Already up to date. {stats['skipped']} existing transaction(s) verified.",
                     icon=":material/check_circle:",
@@ -313,7 +319,7 @@ if sync_clicked:
                 state="error",
                 expanded=True,
             )
-            if isinstance(err, OutlookSignInError):
+            if isinstance(err, (OutlookSignInError, MailFolderError)):
                 st.error(str(err))
             elif isinstance(err, httpx.HTTPStatusError):
                 st.error(f"Microsoft Graph returned HTTP {err.response.status_code}.")

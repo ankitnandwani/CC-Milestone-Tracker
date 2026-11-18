@@ -237,6 +237,9 @@ def sync() -> None:
     typer.echo(f"Parsed: {stats['parsed']}")
     typer.echo(f"Imported: {stats['imported']}")
     typer.echo(f"Skipped: {stats['skipped']}")
+    typer.echo(f"Emails outside the recognized transaction format: {stats['ignored']}")
+    if stats["latest_received_at"]:
+        typer.echo(f"Newest HSBC folder email received: {stats['latest_received_at']}")
     if stats.get("unmatched_cards"):
         typer.secho(
             f"⚠️ {len(stats['unmatched_cards'])} transaction(s) skipped "

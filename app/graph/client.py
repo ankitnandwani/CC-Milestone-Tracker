@@ -1,9 +1,19 @@
 from collections.abc import Iterator
 from types import TracebackType
+from urllib.parse import quote
 
 import httpx
 
-from app.graph.constants import GRAPH_PAGE_SIZE, HSBC_SENDER, HSBC_TRANSACTION_SUBJECT_PREFIX
+from app.graph.constants import (
+    GRAPH_PAGE_SIZE,
+    HSBC_FOLDER_PATH,
+    HSBC_SENDER,
+    HSBC_TRANSACTION_SUBJECT_PREFIX,
+)
+
+
+class MailFolderError(RuntimeError):
+    """The requested Outlook folder could not be resolved."""
 
 
 class GraphClient:
@@ -26,7 +36,7 @@ class GraphClient:
     def me(self) -> dict:
         return self.get("/me")
 
-    def _is_hsbc_transaction(self, email: dict) -> bool:
+    def is_expected_hsbc_alert(self, email: dict) -> bool:
         sender = (email.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
 
         # Flexible match: sender must be HSBC and subject contains configured prefix
@@ -53,7 +63,7 @@ class GraphClient:
             if not next_link:
                 break
 
-            response = self._client.get(next_link).json()
+            response = self.get(next_link)
 
         return items
 
@@ -80,6 +90,25 @@ class GraphClient:
         response.raise_for_status()
         return response.json()
 
+    def _resolve_hsbc_folder(self) -> str:
+        folders_url = "/me/mailFolders"
+        resolved = []
+        for name in HSBC_FOLDER_PATH:
+            resolved.append(name)
+            matches = [
+                folder["id"]
+                for folder in self.get_all_pages(folders_url, params={"$select": "id,displayName"})
+                if folder["displayName"].casefold() == name.casefold()
+            ]
+            if len(matches) != 1:
+                path = " → ".join(resolved)
+                if not matches:
+                    raise MailFolderError(f"Outlook folder not found: {path}.")
+                raise MailFolderError(f"More than one Outlook folder matches {path}.")
+            folder_url = f"/me/mailFolders/{quote(matches[0], safe='')}"
+            folders_url = f"{folder_url}/childFolders"
+        return folder_url
+
     def list_hsbc_transaction_messages(
         self,
         top: int | None = None,
@@ -95,27 +124,21 @@ class GraphClient:
         if top == 0 or max_pages == 0:
             return
 
-        # Graph requires the ordered property to appear first in the filter.
         params = {
-            "$filter": (
-                "receivedDateTime ge 1900-01-01T00:00:00Z"
-                f" and from/emailAddress/address eq '{HSBC_SENDER}'"
-            ),
             "$orderby": "receivedDateTime desc",
             "$top": min(top, GRAPH_PAGE_SIZE) if top is not None else GRAPH_PAGE_SIZE,
             "$select": "id,subject,from,receivedDateTime",
         }
-        response = self.get("/me/messages", params=params)
-        matches = pages_processed = 0
+        response = self.get(f"{self._resolve_hsbc_folder()}/messages", params=params)
+        scanned = pages_processed = 0
 
         while True:
             pages_processed += 1
             for email in response.get("value", []):
-                if self._is_hsbc_transaction(email):
-                    yield email
-                    matches += 1
-                    if top is not None and matches >= top:
-                        return
+                yield email
+                scanned += 1
+                if top is not None and scanned >= top:
+                    return
 
             next_link = response.get("@odata.nextLink")
             if not next_link or (max_pages is not None and pages_processed >= max_pages):

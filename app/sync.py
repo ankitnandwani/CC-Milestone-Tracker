@@ -14,6 +14,8 @@ async def sync_transactions(client: GraphClient) -> dict:
     parsed = 0
     imported = 0
     skipped = 0
+    ignored = 0
+    latest_received_at = None
     failed = []
     unmatched_cards = []
 
@@ -28,6 +30,8 @@ async def sync_transactions(client: GraphClient) -> dict:
 
     for msg in client.iter_hsbc_transaction_messages():
         fetched += 1
+        if latest_received_at is None:
+            latest_received_at = msg.get("receivedDateTime")
         msg_id = msg["id"]
 
         # Quick duplicate check: skip without fetching HTML body
@@ -40,7 +44,10 @@ async def sync_transactions(client: GraphClient) -> dict:
         try:
             tx = parse_transaction(graph_message_id=msg_id, html=html)
         except ValueError as e:
-            failed.append({"id": msg_id, "subject": msg.get("subject", ""), "error": str(e)})
+            if client.is_expected_hsbc_alert(msg):
+                failed.append({"id": msg_id, "subject": msg.get("subject", ""), "error": str(e)})
+            else:
+                ignored += 1
             continue
         parsed += 1
 
@@ -86,6 +93,8 @@ async def sync_transactions(client: GraphClient) -> dict:
         "parsed": parsed,
         "imported": imported,
         "skipped": skipped,
+        "ignored": ignored,
+        "latest_received_at": latest_received_at,
         "failed": failed,
         "unmatched_cards": unmatched_cards,
     }

@@ -30,7 +30,7 @@ Python 3.14 and `uv` manage the runtime and dependencies. Streamlit and pandas p
 ## Import and data model
 
 1. MSAL tries a cached sign-in first. The CLI can open a localhost sign-in on port 8765, and Streamlit can display a Microsoft device code. Both request delegated `User.Read` and `Mail.Read` scopes and store the token cache in the platform-specific CCGeek user data directory.
-2. The Graph client filters by HSBC sender on the server, checks the subject locally, and follows pagination. Sync skips known Graph message IDs before retrieving and parsing the remaining HTML bodies. Each added transaction commits independently so the next sync can resume after a service failure.
+2. The Graph client resolves the Outlook folder `Finance → Banks → HSBC` by name and follows pagination within that folder. Sync skips known Graph message IDs and checks the remaining HTML bodies for the HSBC transaction format, including emails with a changed subject or sender. Each added transaction commits independently so the next sync can resume after a service failure.
 3. The parser returns the card's last four digits, merchant, decimal amount, currency, transaction date and time, and Graph message ID. Sync matches an active card by its last four digits, reports unmatched cards and parsing failures, and writes matched transactions.
 4. The migrated tables are `cards` and `transactions`. Each transaction references a card, and a unique `graph_message_id` prevents repeat imports of the same message ID. The `SyncState` model exists in the source and has no checked-in migration or active role in sync.
 
