@@ -6,6 +6,8 @@ import httpx
 
 from app.graph.constants import (
     GRAPH_PAGE_SIZE,
+    HSBC_DATE_ONLY_SENDER,
+    HSBC_DATE_ONLY_SUBJECT,
     HSBC_FOLDER_PATH,
     HSBC_SENDER,
     HSBC_TRANSACTION_SUBJECT_PREFIX,
@@ -39,9 +41,10 @@ class GraphClient:
     def is_expected_hsbc_alert(self, email: dict) -> bool:
         sender = (email.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
 
-        # Flexible match: sender must be HSBC and subject contains configured prefix
         subject = (email.get("subject") or "").lower()
-        return sender == HSBC_SENDER and HSBC_TRANSACTION_SUBJECT_PREFIX.lower() in subject
+        return (sender == HSBC_SENDER and HSBC_TRANSACTION_SUBJECT_PREFIX.lower() in subject) or (
+            sender == HSBC_DATE_ONLY_SENDER and HSBC_DATE_ONLY_SUBJECT.lower() in subject
+        )
 
     def get_all_pages(
         self,
