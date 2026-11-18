@@ -18,6 +18,7 @@ import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pandas as pd
 import streamlit as st
 from sqlalchemy import desc, func, select
@@ -27,9 +28,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 from app.db import SessionLocal  # noqa: E402
 from app.db.models.card import Card  # noqa: E402
 from app.db.models.transaction import Transaction  # noqa: E402
-from app.graph.auth import authenticate  # noqa: E402
+from app.graph.auth import OutlookSignInError, authenticate  # noqa: E402
 from app.graph.client import GraphClient  # noqa: E402
-from app.parser.hsbc import parse_transaction  # noqa: E402
+from app.sync import sync_transactions  # noqa: E402
 
 # ------------------------------------------------------------
 # Spending target configuration
@@ -48,95 +49,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-
-
-# ------------------------------------------------------------
-# Sync logic
-# ------------------------------------------------------------
-async def _run_sync(client: GraphClient) -> dict:
-    fetched = 0
-    parsed = 0
-    imported = 0
-    skipped = 0
-    failed = []
-    unmatched_cards = []
-
-    messages = client.list_hsbc_transaction_messages(top=100)
-    fetched = len(messages)
-
-    async with SessionLocal() as session:
-        # Prefetch existing transaction IDs for instant duplicate checking
-        existing_tx_res = await session.execute(select(Transaction.graph_message_id))
-        existing_ids = set(existing_tx_res.scalars().all())
-
-        # Prefetch active cards mapped by last4
-        cards_res = await session.execute(select(Card).where(Card.active.is_(True)))
-        cards_by_last4 = {c.last4: c for c in cards_res.scalars().all()}
-
-        for msg in messages:
-            msg_id = msg["id"]
-
-            # Quick duplicate check: skip without downloading HTML body
-            if msg_id in existing_ids:
-                skipped += 1
-                continue
-
-            try:
-                html = client.message_body(msg_id)
-                tx = parse_transaction(graph_message_id=msg_id, html=html)
-            except Exception as e:
-                failed.append(
-                    {
-                        "id": msg_id,
-                        "subject": msg.get("subject", ""),
-                        "error": str(e),
-                    }
-                )
-                continue
-            parsed += 1
-
-            # Match card
-            card = cards_by_last4.get(tx.card_last4)
-            if not card:
-                unmatched_cards.append(
-                    {
-                        "id": msg_id,
-                        "card_last4": tx.card_last4,
-                        "merchant": tx.merchant,
-                        "amount": float(tx.amount),
-                        "subject": msg.get("subject", ""),
-                    }
-                )
-                skipped += 1
-                continue
-
-            # Persist transaction
-            transaction = Transaction(
-                card_id=card.id,
-                graph_message_id=tx.graph_message_id,
-                merchant=tx.merchant,
-                amount=tx.amount,
-                currency=tx.currency,
-                transaction_at=tx.transaction_at,
-                pending=False,
-            )
-            session.add(transaction)
-            try:
-                await session.commit()
-                existing_ids.add(tx.graph_message_id)
-                imported += 1
-            except Exception:
-                await session.rollback()
-                skipped += 1
-
-    return {
-        "fetched": fetched,
-        "parsed": parsed,
-        "imported": imported,
-        "skipped": skipped,
-        "failed": failed,
-        "unmatched_cards": unmatched_cards,
-    }
 
 
 # ------------------------------------------------------------
@@ -325,19 +237,22 @@ if not card:
 # Sync Trigger Handling
 # ------------------------------------------------------------
 if sync_clicked:
-    with st.status(
-        "Connecting to Microsoft Graph and scanning HSBC emails...", expanded=True
-    ) as status_box:
+    with st.status("Connecting to Outlook...", expanded=True) as status_box:
+        stage = "Outlook sign-in"
         try:
-            token = authenticate()
+            token = authenticate(show_device_code=st.info)
+            stage = "Transaction import"
             with GraphClient(token) as client:
                 st.write("Fetching transaction messages...")
-                stats = asyncio.run(_run_sync(client))
+                stats = asyncio.run(sync_transactions(client))
 
             status_box.update(
-                label=f"Sync complete! Imported {stats['imported']} new transaction(s).",
+                label=(
+                    f"Sync complete. Checked {stats['fetched']} alert(s) and imported "
+                    f"{stats['imported']} transaction(s)."
+                ),
                 state="complete",
-                expanded=False,
+                expanded=bool(stats["failed"] or stats["unmatched_cards"]),
             )
 
             if stats["imported"] > 0:
@@ -351,7 +266,7 @@ if sync_clicked:
                     f"Found {len(stats['unmatched_cards'])} transaction(s) for unregistered cards.",
                     icon=":material/warning:",
                 )
-            else:
+            elif not stats["failed"]:
                 st.toast(
                     f"Already up to date. {stats['skipped']} existing transaction(s) verified.",
                     icon=":material/check_circle:",
@@ -386,6 +301,7 @@ if sync_clicked:
                         st.code(item["error"], language="text")
 
             # Refresh data after sync
+            stage = "Dashboard refresh"
             total_spent = asyncio.run(_fetch_total_milestone_spent())
             transactions = asyncio.run(_fetch_all_transactions())
             monthly_df = asyncio.run(_fetch_monthly_spend())
@@ -393,11 +309,16 @@ if sync_clicked:
 
         except Exception as err:
             status_box.update(
-                label="Sync failed. Check credentials or connection.",
+                label=f"{stage} failed.",
                 state="error",
                 expanded=True,
             )
-            st.error(f"Error during synchronization: {err}")
+            if isinstance(err, OutlookSignInError):
+                st.error(str(err))
+            elif isinstance(err, httpx.HTTPStatusError):
+                st.error(f"Microsoft Graph returned HTTP {err.response.status_code}.")
+            else:
+                st.error(f"{stage} failed with {type(err).__name__}.")
 
 
 # ------------------------------------------------------------

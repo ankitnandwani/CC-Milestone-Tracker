@@ -12,7 +12,7 @@ The current workflow covers one HSBC TravelOne card. The broader goal is to mana
 - The dashboard also offers manual email sync, a monthly spend chart, top merchants, searchable transaction history, and CSV export.
 - The CLI can seed the default card and add or list card records. Email discovery and parsing are specific to HSBC alerts.
 - The dashboard displays one active card in its header. The milestone total and monthly chart sum transactions in the milestone window across all cards and currencies as stored. Per-card milestones and currency conversion are future capabilities. Scope the queries before using the dashboard to track a second card's milestone.
-- Both sync entry points are manual. The Streamlit path requests up to 100 matching messages per sync. The CLI path calls Graph without an explicit message cap.
+- Both sync entry points are manual and use the same importer. It follows all pages of HSBC alerts so either entry point can backfill missing transactions.
 
 ## Stack and code map
 
@@ -22,14 +22,15 @@ Python 3.14 and `uv` manage the runtime and dependencies. Streamlit and pandas p
 | --- | --- |
 | Dashboard, milestone constants, SQL queries, and CSV export | `app/ui/streamlit_app.py` |
 | CLI commands for database checks, card enrollment, and mail sync | `app/cli.py` |
+| Shared transaction import and duplicate handling | `app/sync.py` |
 | Microsoft sign-in, local token cache, mail search, and pagination | `app/graph/auth.py`, `app/graph/client.py`, and `app/graph/constants.py` |
 | HSBC alert parsing and normalized transaction fields | `app/parser/hsbc.py` and `app/parser/models.py` |
 | Connection settings, async session factory, models, and migrations | `app/core/config.py`, `app/db/session.py`, `app/db/models/`, and `alembic/versions/` |
 
 ## Import and data model
 
-1. MSAL tries a cached sign-in first, then falls back to interactive sign-in on localhost port 8765. It requests delegated `User.Read` and `Mail.Read` scopes and stores its token cache in the platform-specific CCGeek user data directory.
-2. The Graph client discovers HSBC transaction messages using the configured sender and subject match and follows pagination. Sync skips known Graph message IDs before retrieving and parsing the remaining HTML bodies.
+1. MSAL tries a cached sign-in first. The CLI can open a localhost sign-in on port 8765, and Streamlit can display a Microsoft device code. Both request delegated `User.Read` and `Mail.Read` scopes and store the token cache in the platform-specific CCGeek user data directory.
+2. The Graph client filters by HSBC sender on the server, checks the subject locally, and follows pagination. Sync skips known Graph message IDs before retrieving and parsing the remaining HTML bodies. Each added transaction commits independently so the next sync can resume after a service failure.
 3. The parser returns the card's last four digits, merchant, decimal amount, currency, transaction date and time, and Graph message ID. Sync matches an active card by its last four digits, reports unmatched cards and parsing failures, and writes matched transactions.
 4. The migrated tables are `cards` and `transactions`. Each transaction references a card, and a unique `graph_message_id` prevents repeat imports of the same message ID. The `SyncState` model exists in the source and has no checked-in migration or active role in sync.
 
@@ -48,9 +49,13 @@ uv run streamlit run app/ui/streamlit_app.py
 
 Use `uv run python -m app.cli --help` to discover commands, `graph auth` to verify sign-in, and `graph sync` to import from the CLI. Use `uv run ruff check .` and `uv run ruff format --check .` for static checks. The repository currently has a database connection smoke script in `scripts/test_connection.py`.
 
+## Hosted Outlook sign-in
+
+In the private Streamlit deployment, set `MICROSOFT_MAILBOX_USERNAME` to the Outlook account's sign-in address using a top-level Streamlit secret. In the corresponding Microsoft app registration, set **Authentication → Allow public client flows** to **Yes**. When **Sync emails** displays a code, open Microsoft's sign-in page and complete the prompt within three minutes. This step may be needed again after a hosting restart or credential expiry.
+
 ## Working on the project
 
 - Keep changes simple and use the existing Python functions, SQLAlchemy models, and Streamlit entry point.
-- Check both sync implementations in `app/cli.py` and `app/ui/streamlit_app.py` when changing import behavior. The default card can also be seeded from either entry point.
+- Check the CLI and Streamlit entry points when changing the shared importer. The default card can be seeded from either entry point.
 - Check the models and existing migrations before changing schema. Preserve decimal amounts, the original currency, and message-ID deduplication when changing ingestion. Transaction timestamps currently use timezone-naive values from the parsed alerts.
 - Use synthetic or redacted transaction alerts for examples and fixtures. Keep mailbox data, database credentials, and token caches out of version control.

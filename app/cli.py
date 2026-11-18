@@ -9,6 +9,7 @@ from app.db.models.transaction import Transaction
 from app.graph.auth import authenticate
 from app.graph.client import GraphClient
 from app.parser.hsbc import parse_transaction
+from app.sync import sync_transactions
 
 app = typer.Typer(help="CCGeek CLI")
 
@@ -224,95 +225,12 @@ def list_hsbc_messages(
             typer.echo("-" * 80)
 
 
-async def _run_sync(client: GraphClient) -> dict:
-    """Core sync logic used by the ``graph sync`` CLI command."""
-    fetched = 0
-    parsed = 0
-    imported = 0
-    skipped = 0
-    failed = []
-    unmatched_cards = []
-
-    # Retrieve HSBC transaction messages
-    messages = client.list_hsbc_transaction_messages()
-    fetched = len(messages)
-
-    async with SessionLocal() as session:
-        # Prefetch existing transaction IDs for fast duplicate checking
-        existing_tx_res = await session.execute(select(Transaction.graph_message_id))
-        existing_ids = set(existing_tx_res.scalars().all())
-
-        # Prefetch active cards mapped by last4
-        cards_res = await session.execute(select(Card).where(Card.active.is_(True)))
-        cards_by_last4 = {card.last4: card for card in cards_res.scalars().all()}
-
-        for msg in messages:
-            msg_id = msg["id"]
-
-            # Quick duplicate check: skip without fetching HTML body
-            if msg_id in existing_ids:
-                skipped += 1
-                continue
-
-            # Get full HTML body of the message
-            try:
-                html = client.message_body(msg_id)
-                tx = parse_transaction(graph_message_id=msg_id, html=html)
-            except Exception as e:
-                failed.append({"id": msg_id, "subject": msg.get("subject", ""), "error": str(e)})
-                continue
-            parsed += 1
-
-            # Match card
-            card = cards_by_last4.get(tx.card_last4)
-            if not card:
-                unmatched_cards.append(
-                    {
-                        "id": msg_id,
-                        "card_last4": tx.card_last4,
-                        "merchant": tx.merchant,
-                        "amount": float(tx.amount),
-                        "subject": msg.get("subject", ""),
-                    }
-                )
-                skipped += 1
-                continue
-
-            # Create and persist the Transaction
-            transaction = Transaction(
-                card_id=card.id,
-                graph_message_id=tx.graph_message_id,
-                merchant=tx.merchant,
-                amount=tx.amount,
-                currency=tx.currency,
-                transaction_at=tx.transaction_at,
-                pending=False,
-            )
-            session.add(transaction)
-            try:
-                await session.commit()
-                existing_ids.add(tx.graph_message_id)
-                imported += 1
-            except Exception:
-                await session.rollback()
-                skipped += 1
-
-    return {
-        "fetched": fetched,
-        "parsed": parsed,
-        "imported": imported,
-        "skipped": skipped,
-        "failed": failed,
-        "unmatched_cards": unmatched_cards,
-    }
-
-
 @graph_app.command("sync")
 def sync() -> None:
     """Synchronize HSBC transaction emails into the database."""
     token = authenticate()
     with GraphClient(token) as client:
-        stats = asyncio.run(_run_sync(client))
+        stats = asyncio.run(sync_transactions(client))
 
     typer.secho("Sync complete", fg=typer.colors.GREEN)
     typer.echo(f"Fetched: {stats['fetched']}")

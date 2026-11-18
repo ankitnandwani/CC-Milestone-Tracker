@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     microsoft_client_id: str
     microsoft_tenant_id: str = "common"
+    microsoft_mailbox_username: str | None = None
 
     log_level: str = "INFO"
 

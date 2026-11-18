@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from types import TracebackType
 
 import httpx
@@ -84,54 +85,42 @@ class GraphClient:
         top: int | None = None,
         max_pages: int | None = None,
     ) -> list[dict]:
-        matches: list[dict] = []
+        return list(self.iter_hsbc_transaction_messages(top=top, max_pages=max_pages))
 
-        params: dict = {
-            "$search": f'"{HSBC_TRANSACTION_SUBJECT_PREFIX}"',
-            "$top": min(top, GRAPH_PAGE_SIZE) if top is not None else GRAPH_PAGE_SIZE,
-            "$select": ",".join(
-                [
-                    "id",
-                    "subject",
-                    "from",
-                    "receivedDateTime",
-                ]
+    def iter_hsbc_transaction_messages(
+        self,
+        top: int | None = None,
+        max_pages: int | None = None,
+    ) -> Iterator[dict]:
+        if top == 0 or max_pages == 0:
+            return
+
+        # Graph requires the ordered property to appear first in the filter.
+        params = {
+            "$filter": (
+                "receivedDateTime ge 1900-01-01T00:00:00Z"
+                f" and from/emailAddress/address eq '{HSBC_SENDER}'"
             ),
+            "$orderby": "receivedDateTime desc",
+            "$top": min(top, GRAPH_PAGE_SIZE) if top is not None else GRAPH_PAGE_SIZE,
+            "$select": "id,subject,from,receivedDateTime",
         }
+        response = self.get("/me/messages", params=params)
+        matches = pages_processed = 0
 
-        url: str | None = "/me/messages"
-        pages_processed = 0
-
-        while url:
-            try:
-                response = self.get(
-                    url,
-                    params=params,
-                    headers={"ConsistencyLevel": "eventual"},
-                )
-            except Exception:
-                # Fallback to standard paging if $search fails
-                if url == "/me/messages" and "$search" in params:
-                    params.pop("$search", None)
-                    response = self.get(url, params=params)
-                else:
-                    raise
-
-            emails = response.get("value", [])
-            for email in emails:
-                if self._is_hsbc_transaction(email):
-                    matches.append(email)
-                    if top is not None and len(matches) >= top:
-                        return matches
-
+        while True:
             pages_processed += 1
-            if max_pages is not None and pages_processed >= max_pages:
-                break
+            for email in response.get("value", []):
+                if self._is_hsbc_transaction(email):
+                    yield email
+                    matches += 1
+                    if top is not None and matches >= top:
+                        return
 
-            url = response.get("@odata.nextLink")
-            params = None
-
-        return matches if top is None else matches[:top]
+            next_link = response.get("@odata.nextLink")
+            if not next_link or (max_pages is not None and pages_processed >= max_pages):
+                return
+            response = self.get(next_link)
 
     def message_body(self, message_id: str) -> str:
         message = self.get(
