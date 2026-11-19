@@ -2,14 +2,16 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.db import SessionLocal
+from app.db.enums import Bank
 from app.db.models.card import Card
 from app.db.models.transaction import Transaction
 from app.graph.client import GraphClient
-from app.parser.hsbc import parse_transaction
+from app.graph.constants import AU_FOLDER_PATH, AU_SENDER, AU_SUBJECT
+from app.parser import au, hsbc
 
 
 async def sync_transactions(client: GraphClient) -> dict:
-    """Import HSBC alerts through the CLI or dashboard."""
+    """Import configured card alerts through the CLI or dashboard."""
     fetched = 0
     parsed = 0
     imported = 0
@@ -26,12 +28,21 @@ async def sync_transactions(client: GraphClient) -> dict:
 
         # Prefetch active cards mapped by last4
         cards_res = await session.execute(select(Card).where(Card.active.is_(True)))
-        card_ids = {card.last4: card.id for card in cards_res.scalars()}
+        card_ids = {}
+        for card in cards_res.scalars():
+            card_ids.setdefault((card.bank_name, card.last4), []).append(card.id)
 
-    for msg in client.iter_hsbc_transaction_messages():
+    sources = [(Bank.HSBC, client.iter_hsbc_transaction_messages(), hsbc.parse_transaction)]
+    if any(bank == Bank.AU for bank, _ in card_ids):
+        sources.append((Bank.AU, client.iter_folder_messages(AU_FOLDER_PATH), au.parse_transaction))
+
+    messages = ((bank, message, parse) for bank, source, parse in sources for message in source)
+
+    for bank, msg, parse in messages:
         fetched += 1
-        if latest_received_at is None:
-            latest_received_at = msg.get("receivedDateTime")
+        received_at = msg.get("receivedDateTime")
+        if received_at and (latest_received_at is None or received_at > latest_received_at):
+            latest_received_at = received_at
         msg_id = msg["id"]
 
         # Quick duplicate check: skip without fetching HTML body
@@ -42,9 +53,17 @@ async def sync_transactions(client: GraphClient) -> dict:
         # Get full HTML body of the message
         html = client.message_body(msg_id)
         try:
-            tx = parse_transaction(graph_message_id=msg_id, html=html)
+            tx = parse(graph_message_id=msg_id, html=html)
         except ValueError as e:
-            if client.is_expected_hsbc_alert(msg):
+            if bank == Bank.HSBC:
+                expected = client.is_expected_hsbc_alert(msg)
+            else:
+                sender = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+                expected = (
+                    sender == AU_SENDER
+                    and AU_SUBJECT.casefold() in (msg.get("subject") or "").casefold()
+                )
+            if expected:
                 failed.append({"id": msg_id, "subject": msg.get("subject", ""), "error": str(e)})
             else:
                 ignored += 1
@@ -52,11 +71,13 @@ async def sync_transactions(client: GraphClient) -> dict:
         parsed += 1
 
         # Match card
-        card_id = card_ids.get(tx.card_last4)
-        if card_id is None:
+        matches = card_ids.get((bank, tx.card_last4), [])
+        if len(matches) != 1:
             unmatched_cards.append(
                 {
                     "id": msg_id,
+                    "bank": bank,
+                    "reason": "multiple active matches" if matches else "no active match",
                     "card_last4": tx.card_last4,
                     "merchant": tx.merchant,
                     "amount": float(tx.amount),
@@ -69,7 +90,7 @@ async def sync_transactions(client: GraphClient) -> dict:
         statement = (
             insert(Transaction)
             .values(
-                card_id=card_id,
+                card_id=matches[0],
                 graph_message_id=tx.graph_message_id,
                 merchant=tx.merchant,
                 amount=tx.amount,

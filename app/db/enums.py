@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class Bank(StrEnum):
     HSBC = "HSBC"
+    AU = "AU"
     HDFC = "HDFC"
     ICICI = "ICICI"
     AXIS = "AXIS"

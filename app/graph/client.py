@@ -93,10 +93,10 @@ class GraphClient:
         response.raise_for_status()
         return response.json()
 
-    def _resolve_hsbc_folder(self) -> str:
+    def _resolve_folder(self, folder_path: tuple[str, ...]) -> str:
         folders_url = "/me/mailFolders"
         resolved = []
-        for name in HSBC_FOLDER_PATH:
+        for name in folder_path:
             resolved.append(name)
             matches = [
                 folder["id"]
@@ -124,6 +124,11 @@ class GraphClient:
         top: int | None = None,
         max_pages: int | None = None,
     ) -> Iterator[dict]:
+        yield from self.iter_folder_messages(HSBC_FOLDER_PATH, top=top, max_pages=max_pages)
+
+    def iter_folder_messages(
+        self, folder_path: tuple[str, ...], top: int | None = None, max_pages: int | None = None
+    ) -> Iterator[dict]:
         if top == 0 or max_pages == 0:
             return
 
@@ -132,7 +137,7 @@ class GraphClient:
             "$top": min(top, GRAPH_PAGE_SIZE) if top is not None else GRAPH_PAGE_SIZE,
             "$select": "id,subject,from,receivedDateTime",
         }
-        response = self.get(f"{self._resolve_hsbc_folder()}/messages", params=params)
+        response = self.get(f"{self._resolve_folder(folder_path)}/messages", params=params)
         scanned = pages_processed = 0
 
         while True:

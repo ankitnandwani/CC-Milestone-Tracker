@@ -15,8 +15,9 @@ Run with:
 import asyncio
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -26,20 +27,13 @@ from sqlalchemy import desc, func, select
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from app.db import SessionLocal  # noqa: E402
+from app.db.enums import Bank, CardNetwork  # noqa: E402
 from app.db.models.card import Card  # noqa: E402
 from app.db.models.transaction import Transaction  # noqa: E402
 from app.graph.auth import OutlookSignInError, authenticate  # noqa: E402
 from app.graph.client import GraphClient, MailFolderError  # noqa: E402
-from app.graph.constants import HSBC_FOLDER_PATH  # noqa: E402
+from app.milestones import card_milestones  # noqa: E402
 from app.sync import sync_transactions  # noqa: E402
-
-# ------------------------------------------------------------
-# Spending target configuration
-# ------------------------------------------------------------
-TARGET_START = datetime(2026, 6, 13)
-TARGET_END = datetime(2027, 6, 12, 23, 59, 59)
-TARGET_AMOUNT = Decimal("1200000")  # Rs 12 Lakhs
-
 
 # ------------------------------------------------------------
 # Page configuration
@@ -55,25 +49,29 @@ st.set_page_config(
 # ------------------------------------------------------------
 # Database queries
 # ------------------------------------------------------------
-async def _fetch_card_info() -> Card | None:
+async def _fetch_cards() -> list[Card]:
     async with SessionLocal() as session:
-        res = await session.execute(select(Card).where(Card.active.is_(True)).limit(1))
-        return res.scalar_one_or_none()
+        res = await session.execute(
+            select(Card).where(Card.active.is_(True)).order_by(Card.created_at, Card.id)
+        )
+        return list(res.scalars())
 
 
-async def _fetch_total_milestone_spent() -> Decimal:
+async def _fetch_milestone_spend(card: Card, start: datetime, end: datetime) -> tuple[Decimal, int]:
     async with SessionLocal() as session:
         result = await session.execute(
-            select(func.sum(Transaction.amount)).where(
-                Transaction.transaction_at >= TARGET_START,
-                Transaction.transaction_at <= TARGET_END,
+            select(func.sum(Transaction.amount), func.count(Transaction.id)).where(
+                Transaction.card_id == card.id,
+                Transaction.currency == card.currency,
+                Transaction.transaction_at >= start,
+                Transaction.transaction_at < end,
             )
         )
-        total = result.scalar()
-        return total or Decimal("0")
+        total, count = result.one()
+        return total or Decimal("0"), count
 
 
-async def _fetch_all_transactions() -> list[dict]:
+async def _fetch_all_transactions(card: Card) -> list[dict]:
     async with SessionLocal() as session:
         result = await session.execute(
             select(
@@ -86,6 +84,7 @@ async def _fetch_all_transactions() -> list[dict]:
                 Transaction.graph_message_id,
             )
             .join(Card, Transaction.card_id == Card.id)
+            .where(Transaction.card_id == card.id)
             .order_by(desc(Transaction.transaction_at))
         )
         rows = result.all()
@@ -113,7 +112,7 @@ async def _fetch_all_transactions() -> list[dict]:
     return records
 
 
-async def _fetch_monthly_spend() -> pd.DataFrame:
+async def _fetch_monthly_spend(card: Card) -> pd.DataFrame:
     async with SessionLocal() as session:
         result = await session.execute(
             select(
@@ -122,8 +121,8 @@ async def _fetch_monthly_spend() -> pd.DataFrame:
                 func.count(Transaction.id).label("tx_count"),
             )
             .where(
-                Transaction.transaction_at >= TARGET_START,
-                Transaction.transaction_at <= TARGET_END,
+                Transaction.card_id == card.id,
+                Transaction.currency == card.currency,
             )
             .group_by("month")
             .order_by("month")
@@ -131,12 +130,12 @@ async def _fetch_monthly_spend() -> pd.DataFrame:
         rows = result.all()
 
     if not rows:
-        return pd.DataFrame(columns=["Month", "Spend (₹)", "Transactions"])
+        return pd.DataFrame(columns=["Month", "Spend", "Transactions"])
 
     data = [
         {
             "Month": r.month.strftime("%b %Y"),
-            "Spend (₹)": float(r.total_spend),
+            "Spend": float(r.total_spend),
             "Transactions": int(r.tx_count),
         }
         for r in rows
@@ -144,7 +143,7 @@ async def _fetch_monthly_spend() -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-async def _fetch_top_merchants(limit: int = 7) -> pd.DataFrame:
+async def _fetch_top_merchants(card: Card, limit: int = 7) -> pd.DataFrame:
     async with SessionLocal() as session:
         result = await session.execute(
             select(
@@ -152,6 +151,7 @@ async def _fetch_top_merchants(limit: int = 7) -> pd.DataFrame:
                 func.sum(Transaction.amount).label("total_spend"),
                 func.count(Transaction.id).label("tx_count"),
             )
+            .where(Transaction.card_id == card.id, Transaction.currency == card.currency)
             .group_by(Transaction.merchant)
             .order_by(desc("total_spend"))
             .limit(limit)
@@ -159,12 +159,12 @@ async def _fetch_top_merchants(limit: int = 7) -> pd.DataFrame:
         rows = result.all()
 
     if not rows:
-        return pd.DataFrame(columns=["Merchant", "Total Spend (₹)", "Transactions"])
+        return pd.DataFrame(columns=["Merchant", "Total Spend", "Transactions"])
 
     data = [
         {
             "Merchant": r.merchant,
-            "Total Spend (₹)": float(r.total_spend),
+            "Total Spend": float(r.total_spend),
             "Transactions": int(r.tx_count),
         }
         for r in rows
@@ -173,10 +173,10 @@ async def _fetch_top_merchants(limit: int = 7) -> pd.DataFrame:
 
 
 async def _seed_default_card() -> None:
-    from app.db.enums import Bank, CardNetwork
-
     async with SessionLocal() as session:
-        res = await session.execute(select(Card).where(Card.last4 == "2677"))
+        res = await session.execute(
+            select(Card).where(Card.bank_name == Bank.HSBC, Card.last4 == "2677")
+        )
         if not res.scalar_one_or_none():
             c = Card(
                 bank_name=Bank.HSBC,
@@ -190,14 +190,28 @@ async def _seed_default_card() -> None:
             await session.commit()
 
 
-# ------------------------------------------------------------
-# Fetch initial state
-# ------------------------------------------------------------
-card = asyncio.run(_fetch_card_info())
-total_spent = asyncio.run(_fetch_total_milestone_spent())
-transactions = asyncio.run(_fetch_all_transactions())
-monthly_df = asyncio.run(_fetch_monthly_spend())
-top_merchants_df = asyncio.run(_fetch_top_merchants(limit=7))
+async def _configure_au_card() -> None:
+    async with SessionLocal.begin() as session:
+        result = await session.execute(
+            select(Card).where(Card.bank_name == Bank.AU, Card.last4 == "3052")
+        )
+        card = result.scalar_one_or_none()
+        if card is None:
+            session.add(
+                Card(
+                    bank_name=Bank.AU,
+                    card_name="Zenith⁺",
+                    card_network=CardNetwork.VISA,
+                    last4="3052",
+                    currency="INR",
+                    active=True,
+                )
+            )
+        else:
+            card.active = True
+
+
+cards = asyncio.run(_fetch_cards())
 
 # ------------------------------------------------------------
 # Header & Navigation
@@ -206,15 +220,10 @@ header_col1, header_col2 = st.columns([3, 1], vertical_alignment="center")
 
 with header_col1:
     st.title("CCGeek")
-    if card:
-        bank_name = card.bank_name.value if hasattr(card.bank_name, "value") else card.bank_name
-        card_label = f"💳 {bank_name} {card.card_name} · •••• {card.last4}"
-    else:
-        card_label = "💳 Credit Card"
-    st.markdown(
-        f":blue-badge[{card_label}] :green-badge[● Connected] "
-        ":violet-badge[🎯 ₹12L Milestone Tracker]"
-    )
+    cards_by_id = {item.id: item for item in cards}
+    labels = {item.id: f"{item.bank_name} {item.card_name} · •••• {item.last4}" for item in cards}
+    selected_id = st.selectbox("Card", list(cards_by_id), format_func=labels.__getitem__)
+    card = cards_by_id.get(selected_id)
 
 with header_col2:
     sync_clicked = st.button(
@@ -234,6 +243,11 @@ if not card:
             asyncio.run(_seed_default_card())
             st.rerun()
 
+if not any(item.bank_name == Bank.AU and item.last4 == "3052" for item in cards):
+    if st.button("Add AU Zenith⁺ (••3052)"):
+        asyncio.run(_configure_au_card())
+        st.rerun()
+
 # ------------------------------------------------------------
 # Sync Trigger Handling
 # ------------------------------------------------------------
@@ -244,17 +258,17 @@ if sync_clicked:
             token = authenticate(show_device_code=st.info)
             stage = "Transaction import"
             with GraphClient(token) as client:
-                st.write(f"Scanning Outlook folder **{' → '.join(HSBC_FOLDER_PATH)}**.")
+                st.write("Scanning the Outlook folders for configured cards.")
                 stats = asyncio.run(sync_transactions(client))
 
             if received_at := stats["latest_received_at"]:
-                st.write(f"Newest email in the folder by received date: {received_at[:10]}.")
+                st.write(f"Newest email received: {received_at[:10]}.")
             if stats["ignored"]:
                 st.write(f"{stats['ignored']} email(s) did not match the transaction format.")
 
             status_box.update(
                 label=(
-                    f"Sync complete. Checked {stats['fetched']} email(s) in HSBC and imported "
+                    f"Sync complete. Checked {stats['fetched']} email(s) and imported "
                     f"{stats['imported']} transaction(s)."
                 ),
                 state="complete",
@@ -284,10 +298,11 @@ if sync_clicked:
                     expanded=True,
                     icon=":material/warning:",
                 ):
-                    st.write("Transactions were found for cards not configured in your database:")
+                    st.write("Some transactions could not be assigned to a single active card.")
                     for item in stats["unmatched_cards"]:
                         st.caption(
-                            f"**Card Last 4**: `•••• {item['card_last4']}` "
+                            f"**Card**: {item['bank']} •••• {item['card_last4']} "
+                            f"({item['reason']}) "
                             f"| **Merchant**: {item['merchant']} "
                             f"| **Amount**: ₹{item['amount']:,.2f}"
                         )
@@ -306,13 +321,6 @@ if sync_clicked:
                         st.caption(f"**ID**: `{item['id']}` — **Subject**: {item['subject']}")
                         st.code(item["error"], language="text")
 
-            # Refresh data after sync
-            stage = "Dashboard refresh"
-            total_spent = asyncio.run(_fetch_total_milestone_spent())
-            transactions = asyncio.run(_fetch_all_transactions())
-            monthly_df = asyncio.run(_fetch_monthly_spend())
-            top_merchants_df = asyncio.run(_fetch_top_merchants(limit=7))
-
         except Exception as err:
             status_box.update(
                 label=f"{stage} failed.",
@@ -327,71 +335,46 @@ if sync_clicked:
                 st.error(f"{stage} failed with {type(err).__name__}.")
 
 
-# ------------------------------------------------------------
-# Hero: Milestone Spending Progress Card
-# ------------------------------------------------------------
-progress_fraction = (
-    min(float(total_spent) / float(TARGET_AMOUNT), 1.0) if TARGET_AMOUNT > 0 else 0.0
-)
-progress_pct = progress_fraction * 100
-remaining_amount = max(Decimal("0"), TARGET_AMOUNT - total_spent)
+if card is None:
+    st.stop()
 
-# Date calculations
-now = datetime.now(UTC).replace(tzinfo=None)
-days_total = max(1, (TARGET_END - TARGET_START).days)
-days_elapsed = max(0, min(days_total, (now - TARGET_START).days))
-days_remaining = max(0, (TARGET_END - now).days)
-
-# Pace calculations
-current_daily_pace = float(total_spent) / max(1, days_elapsed) if days_elapsed > 0 else 0.0
-required_daily_pace = (
-    float(remaining_amount) / max(1, days_remaining) if days_remaining > 0 else 0.0
-)
-
-with st.container(border=True):
-    col_target_title, col_target_badge = st.columns([3, 1], vertical_alignment="center")
-    with col_target_title:
-        st.subheader("Spending milestone target — ₹12,00,000")
-        start_str = TARGET_START.strftime("%B %d, %Y")
-        end_str = TARGET_END.strftime("%B %d, %Y")
-        st.caption(f"Period: **{start_str}** to **{end_str}**")
-    with col_target_badge:
-        if progress_fraction >= 1.0:
-            st.badge("Milestone Achieved! 🏆", color="green")
-        else:
-            st.badge(f"{progress_pct:.1f}% achieved", color="blue")
-
-    st.progress(progress_fraction)
-
-    # Key KPI metrics row
-    with st.container(horizontal=True):
-        st.metric(
-            label="Total spent in milestone",
-            value=f"₹{total_spent:,.2f}",
-            delta=f"{progress_pct:.1f}% achieved",
-            border=True,
-        )
-        st.metric(
-            label="Remaining to target",
-            value=f"₹{remaining_amount:,.2f}",
-            delta=f"{days_remaining} days left",
+now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+symbol = "₹" if card.currency == "INR" else f"{card.currency} "
+if card.bank_name == Bank.AU:
+    st.caption("Milestone progress uses imported INR purchase alerts.")
+period_spend = {}
+for title, target, start, end in card_milestones(card.bank_name, card.last4, now.date()):
+    if (start, end) not in period_spend:
+        period_spend[start, end] = asyncio.run(_fetch_milestone_spend(card, start, end))
+    total, count = period_spend[start, end]
+    progress = max(0.0, min(float(total / target), 1.0))
+    remaining = max(Decimal("0"), target - total)
+    close_date = (end - timedelta(days=1)).date()
+    days_left = max(0, (end.date() - now.date()).days) if now >= start else (end - start).days
+    elapsed = max(0, (min(now.date(), close_date) - start.date()).days + 1)
+    with st.container(border=True):
+        st.subheader(f"{title} · {symbol}{target:,.0f}")
+        st.caption(f"{start:%b %d, %Y} – {close_date:%b %d, %Y}")
+        st.progress(progress)
+        columns = st.columns(4)
+        columns[0].metric("Spend in period", f"{symbol}{total:,.2f}", f"{progress:.1%} achieved")
+        columns[1].metric(
+            "Remaining to target",
+            f"{symbol}{remaining:,.2f}",
+            f"{days_left} days left",
             delta_color="off",
-            border=True,
         )
-        st.metric(
-            label="Current daily spend",
-            value=f"₹{current_daily_pace:,.0f} / day",
-            delta=f"Need ₹{required_daily_pace:,.0f} / day",
-            delta_color="normal" if current_daily_pace >= required_daily_pace else "off",
-            border=True,
-        )
-        st.metric(
-            label="Total transactions",
-            value=f"{len(transactions)}",
-            delta=f"Avg ₹{float(total_spent) / max(1, len(transactions)):,.0f} / txn",
+        columns[2].metric(
+            "Current daily spend",
+            f"{symbol}{total / max(1, elapsed):,.0f} / day",
+            f"Need {symbol}{remaining / days_left:,.0f} / day" if days_left else None,
             delta_color="off",
-            border=True,
         )
+        columns[3].metric("Transactions in period", count)
+
+transactions = asyncio.run(_fetch_all_transactions(card))
+monthly_df = asyncio.run(_fetch_monthly_spend(card))
+top_merchants_df = asyncio.run(_fetch_top_merchants(card))
 
 # ------------------------------------------------------------
 # Visual Analytics Row
@@ -405,7 +388,7 @@ with col_analytics1:
             st.bar_chart(
                 monthly_df,
                 x="Month",
-                y="Spend (₹)",
+                y="Spend",
                 color="#4F46E5",
             )
         else:
@@ -418,7 +401,7 @@ with col_analytics2:
             st.bar_chart(
                 top_merchants_df,
                 x="Merchant",
-                y="Total Spend (₹)",
+                y="Total Spend",
                 color="#06B6D4",
                 horizontal=True,
             )
@@ -441,7 +424,7 @@ with st.container(border=True):
             st.download_button(
                 "Export CSV",
                 data=csv_data,
-                file_name="ccgeek_transactions.csv",
+                file_name=f"ccgeek_transactions_{card.last4}.csv",
                 mime="text/csv",
                 icon=":material/download:",
             )
@@ -494,8 +477,8 @@ with st.container(border=True):
                     width="medium",
                 ),
                 "Amount": st.column_config.NumberColumn(
-                    "Amount (INR)",
-                    format="₹%,.2f",
+                    "Amount",
+                    format="%,.2f",
                 ),
                 "Currency": st.column_config.TextColumn(
                     "Currency",

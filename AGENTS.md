@@ -4,15 +4,17 @@
 
 CCGeek is a personal credit card tracker for one user. It imports transaction alerts from Outlook or Hotmail, records spending, and answers how much more the user needs to spend before a card's milestone deadline.
 
-The current workflow covers one HSBC TravelOne card. The broader goal is to manage more cards and add tracking features as requirements are defined. Update this guide as those decisions are made and features ship.
+The current workflow supports HSBC TravelOne and AU Zenith⁺. The broader goal is to manage more cards and add tracking features as requirements are defined. Update this guide as those decisions are made and features ship.
+
+The [second-card implementation brief](docs/add-second-card.md) records the required inputs, code entry points, and acceptance checks for the next feature.
 
 ## Current behavior
 
 - The Streamlit dashboard tracks a fixed ₹12,00,000 milestone from June 13, 2026 through June 12, 2027. It shows progress, remaining spend, days left, and daily spend pace.
 - The dashboard also offers manual email sync, a monthly spend chart, top merchants, searchable transaction history, and CSV export.
-- The CLI can seed the default card and add or list card records. Email discovery and parsing are specific to HSBC alerts.
-- The dashboard displays one active card in its header. The milestone total and monthly chart sum transactions in the milestone window across all cards and currencies as stored. Per-card milestones and currency conversion are future capabilities. Scope the queries before using the dashboard to track a second card's milestone.
-- Both sync entry points are manual and use the same importer. It follows all pages of HSBC alerts so either entry point can backfill missing transactions.
+- The CLI can seed the default card and add or list card records. Outlook sync supports HSBC and AU purchase alerts. Use **Add AU Zenith⁺** in the dashboard to enable AU imports.
+- The card selector scopes milestones, analytics, history, and exports to the chosen card. Milestones and spend charts use the card’s billing currency. Transaction history retains the original currency.
+- Both sync entry points are manual and use the same importer. It follows all pages in the configured Outlook folders so either entry point can backfill missing transactions.
 
 ## Stack and code map
 
@@ -20,18 +22,18 @@ Python 3.14 and `uv` manage the runtime and dependencies. Streamlit and pandas p
 
 | Area | Where to start |
 | --- | --- |
-| Dashboard, milestone constants, SQL queries, and CSV export | `app/ui/streamlit_app.py` |
+| Dashboard, milestone windows, SQL queries, and CSV export | `app/ui/streamlit_app.py` and `app/milestones.py` |
 | CLI commands for database checks, card enrollment, and mail sync | `app/cli.py` |
 | Shared transaction import and duplicate handling | `app/sync.py` |
 | Microsoft sign-in, local token cache, mail search, and pagination | `app/graph/auth.py`, `app/graph/client.py`, and `app/graph/constants.py` |
-| HSBC alert parsing and normalized transaction fields | `app/parser/hsbc.py` and `app/parser/models.py` |
+| Alert parsing and normalized transaction fields | `app/parser/hsbc.py`, `app/parser/au.py`, and `app/parser/models.py` |
 | Connection settings, async session factory, models, and migrations | `app/core/config.py`, `app/db/session.py`, `app/db/models/`, and `alembic/versions/` |
 
 ## Import and data model
 
 1. MSAL tries a cached sign-in first. The CLI can open a localhost sign-in on port 8765, and Streamlit can display a Microsoft device code. Both request delegated `User.Read` and `Mail.Read` scopes and store the token cache in the platform-specific CCGeek user data directory.
-2. The Graph client resolves the Outlook folder `Finance → Banks → HSBC` by name and follows pagination within that folder. Sync skips known Graph message IDs and checks the remaining HTML bodies for the HSBC transaction format, including emails with a changed subject or sender. Each added transaction commits independently so the next sync can resume after a service failure.
-3. The parser returns the card's last four digits, merchant, decimal amount, currency, transaction date and time, and Graph message ID. Sync matches an active card by its last four digits, reports unmatched cards and parsing failures, and writes matched transactions.
+2. The Graph client resolves the Outlook folders `Finance → Banks → HSBC` and `Finance → Banks → AU` by name and follows pagination within each folder. Sync skips known Graph message IDs and parses the remaining HTML bodies using the issuer’s purchase alert format. Each added transaction commits independently so the next sync can resume after a service failure.
+3. The parser returns the card's last four digits, merchant, decimal amount, currency, transaction date and time, and Graph message ID. Sync matches a single active card by issuer and last four digits, reports unmatched cards and parsing failures, and writes matched transactions.
 4. The migrated tables are `cards` and `transactions`. Each transaction references a card, and a unique `graph_message_id` prevents repeat imports of the same message ID. The `SyncState` model exists in the source and has no checked-in migration or active role in sync.
 
 ## Local development

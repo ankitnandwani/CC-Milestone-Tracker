@@ -4,6 +4,7 @@ import typer
 from sqlalchemy import select
 
 from app.db import SessionLocal
+from app.db.enums import Bank, CardNetwork
 from app.db.models.card import Card
 from app.db.models.transaction import Transaction
 from app.graph.auth import authenticate
@@ -42,11 +43,11 @@ def seed_db() -> None:
 
     async def _seed() -> None:
         async with SessionLocal() as session:
-            res = await session.execute(select(Card).where(Card.last4 == "2677"))
+            res = await session.execute(
+                select(Card).where(Card.bank_name == Bank.HSBC, Card.last4 == "2677")
+            )
             card = res.scalar_one_or_none()
             if not card:
-                from app.db.enums import Bank, CardNetwork
-
                 card = Card(
                     bank_name=Bank.HSBC,
                     card_name="TravelOne",
@@ -96,7 +97,9 @@ def list_cards() -> None:
 
 @card_app.command("add")
 def add_card(
-    bank: str = typer.Option(..., "--bank", "-b", help="Bank name (HSBC, HDFC, ICICI, AXIS, AMEX)"),
+    bank: str = typer.Option(
+        ..., "--bank", "-b", help="Bank name (HSBC, AU, HDFC, ICICI, AXIS, AMEX)"
+    ),
     name: str = typer.Option(
         ..., "--name", "-n", help="Card name (e.g. TravelOne, Live+, Premier)"
     ),
@@ -107,10 +110,10 @@ def add_card(
     """Add a new credit card to track."""
 
     async def _add() -> None:
-        from app.db.enums import Bank, CardNetwork
-
         async with SessionLocal() as session:
-            res = await session.execute(select(Card).where(Card.last4 == last4.strip()))
+            res = await session.execute(
+                select(Card).where(Card.last4 == last4.strip(), Card.bank_name == bank.upper())
+            )
             if res.scalar_one_or_none():
                 typer.secho(f"Card with last4 {last4} already exists!", fg=typer.colors.RED)
                 return
@@ -227,7 +230,7 @@ def list_hsbc_messages(
 
 @graph_app.command("sync")
 def sync() -> None:
-    """Synchronize HSBC transaction emails into the database."""
+    """Synchronize configured card transaction emails into the database."""
     token = authenticate()
     with GraphClient(token) as client:
         stats = asyncio.run(sync_transactions(client))
